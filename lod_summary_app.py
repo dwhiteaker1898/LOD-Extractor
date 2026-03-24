@@ -20,7 +20,6 @@ EXPECTED_FIELD_COUNT = 178
 METADATA_FIELD_COUNT = 10
 HOURS_PER_WEEK = 168
 SUCCESS_PREFIX = "\u2713"
-DEFAULT_OUTPUT_SUBFOLDER = "LOD_Exports"
 
 
 def application_dir() -> str:
@@ -30,7 +29,7 @@ def application_dir() -> str:
 
 
 def default_output_dir(source_folder: str) -> str:
-    return os.path.join(source_folder, DEFAULT_OUTPUT_SUBFOLDER)
+    return source_folder
 
 
 @dataclass
@@ -40,6 +39,7 @@ class LodRecord:
     area: str
     series_type: str
     values: list[float]
+    start_hour_offset: int = 0
 
 
 def parse_lod_file(path: str, series_type: str, trim_edge_weeks: bool) -> list[LodRecord]:
@@ -77,6 +77,7 @@ def parse_lod_file(path: str, series_type: str, trim_edge_weeks: bool) -> list[L
                     week_start=week_start,
                     area=parts[3],
                     series_type=current_series,
+                    start_hour_offset=0,
                     values=values,
                 )
             )
@@ -85,14 +86,39 @@ def parse_lod_file(path: str, series_type: str, trim_edge_weeks: bool) -> list[L
         raise ValueError(f"{os.path.basename(path)} does not contain any {series_type} records.")
 
     if trim_edge_weeks:
-        dominant_year = Counter(
-            (record.week_start + timedelta(days=3)).year for record in records
-        ).most_common(1)[0][0]
-        records = [
-            record
-            for record in records
-            if (record.week_start + timedelta(days=3)).year == dominant_year
-        ]
+        hour_counts: Counter[int] = Counter()
+        for record in records:
+            start_dt = datetime.combine(record.week_start, datetime.min.time())
+            for offset in range(len(record.values)):
+                timestamp = start_dt + timedelta(hours=offset)
+                hour_counts[timestamp.year] += 1
+
+        dominant_year = hour_counts.most_common(1)[0][0]
+        trimmed_records: list[LodRecord] = []
+        for record in records:
+            start_dt = datetime.combine(record.week_start, datetime.min.time())
+            included_offsets = [
+                offset
+                for offset in range(len(record.values))
+                if (start_dt + timedelta(hours=offset)).year == dominant_year
+            ]
+            if not included_offsets:
+                continue
+
+            first_offset = included_offsets[0]
+            last_offset = included_offsets[-1]
+            trimmed_records.append(
+                LodRecord(
+                    file_name=record.file_name,
+                    week_start=record.week_start,
+                    area=record.area,
+                    series_type=record.series_type,
+                    start_hour_offset=record.start_hour_offset + first_offset,
+                    values=record.values[first_offset : last_offset + 1],
+                )
+            )
+
+        records = trimmed_records
 
     return records
 
@@ -101,7 +127,9 @@ def hourly_rows(records: list[LodRecord]) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
 
     for record in records:
-        start_dt = datetime.combine(record.week_start, datetime.min.time())
+        start_dt = datetime.combine(record.week_start, datetime.min.time()) + timedelta(
+            hours=record.start_hour_offset
+        )
         for offset, value in enumerate(record.values):
             timestamp = start_dt + timedelta(hours=offset)
             rows.append(
@@ -114,7 +142,7 @@ def hourly_rows(records: list[LodRecord]) -> list[dict[str, object]]:
                     "month": timestamp.month,
                     "day": timestamp.day,
                     "hour": timestamp.hour + 1,
-                    "value_mw": round(value, 6),
+                    "energy_mwh": round(value, 6),
                 }
             )
 
@@ -122,10 +150,12 @@ def hourly_rows(records: list[LodRecord]) -> list[dict[str, object]]:
 
 
 def aggregate_rows(records: list[LodRecord], view_type: str) -> list[dict[str, object]]:
-    grouped: defaultdict[tuple, float] = defaultdict(float)
+    grouped: dict[tuple, dict[str, float]] = {}
 
     for record in records:
-        start_dt = datetime.combine(record.week_start, datetime.min.time())
+        start_dt = datetime.combine(record.week_start, datetime.min.time()) + timedelta(
+            hours=record.start_hour_offset
+        )
         for offset, value in enumerate(record.values):
             timestamp = start_dt + timedelta(hours=offset)
 
@@ -156,11 +186,15 @@ def aggregate_rows(records: list[LodRecord], view_type: str) -> list[dict[str, o
             else:
                 raise ValueError(f"Unsupported view type: {view_type}")
 
-            grouped[key] += value
+            stats = grouped.setdefault(key, {"total_mwh": 0.0, "peak_mw": float("-inf")})
+            stats["total_mwh"] += value
+            stats["peak_mw"] = max(stats["peak_mw"], value)
 
     rows: list[dict[str, object]] = []
     for key in sorted(grouped):
-        total = round(grouped[key], 6)
+        stats = grouped[key]
+        total = round(stats["total_mwh"], 6)
+        peak = round(stats["peak_mw"], 6)
 
         if view_type == "daily":
             source_file, area, series_type, year, month, day = key
@@ -172,7 +206,8 @@ def aggregate_rows(records: list[LodRecord], view_type: str) -> list[dict[str, o
                     "year": year,
                     "month": month,
                     "day": day,
-                    "value_mw": total,
+                    "energy_mwh": total,
+                    "peak_mw": peak,
                 }
             )
         elif view_type == "monthly":
@@ -184,7 +219,8 @@ def aggregate_rows(records: list[LodRecord], view_type: str) -> list[dict[str, o
                     "series_type": series_type,
                     "year": year,
                     "month": month,
-                    "value_mw": total,
+                    "energy_mwh": total,
+                    "peak_mw": peak,
                 }
             )
         elif view_type == "annually":
@@ -195,7 +231,8 @@ def aggregate_rows(records: list[LodRecord], view_type: str) -> list[dict[str, o
                     "area": area,
                     "series_type": series_type,
                     "year": year,
-                    "value_mw": total,
+                    "energy_mwh": total,
+                    "peak_mw": peak,
                 }
             )
 
@@ -232,6 +269,7 @@ class LodSummaryApp:
         self.series_type = tk.StringVar(value="ALOD")
         self.view_vars = {key: tk.BooleanVar(value=(key == "hourly")) for key, _ in VIEW_OPTIONS}
         self.trim_edge_weeks = tk.BooleanVar(value=True)
+        self.combine_output = tk.BooleanVar(value=False)
         self.status_text = tk.StringVar(value="Select a folder that contains .LOD files, then export.")
 
         self._build_ui()
@@ -281,6 +319,11 @@ class LodSummaryApp:
         ttk.Checkbutton(options_frame, text="Trim edge weeks", variable=self.trim_edge_weeks).grid(
             row=1, column=0, sticky="w", pady=(12, 0)
         )
+        ttk.Checkbutton(
+            options_frame,
+            text="Combine Into One Report",
+            variable=self.combine_output,
+        ).grid(row=1, column=1, sticky="w", pady=(12, 0))
 
         output_frame = ttk.LabelFrame(container, text="Output Folder", padding=12)
         output_frame.grid(row=2, column=0, sticky="ew", pady=(12, 0))
@@ -375,13 +418,36 @@ class LodSummaryApp:
         self.status_text.set("Exporting...")
         self.root.update_idletasks()
 
+        parsed_records_by_file: dict[str, list[LodRecord]] = {}
         for path in self.selected_files:
             try:
-                records = parse_lod_file(
+                parsed_records_by_file[path] = parse_lod_file(
                     path=path,
                     series_type=self.series_type.get(),
                     trim_edge_weeks=self.trim_edge_weeks.get(),
                 )
+            except Exception as exc:
+                failures.append(f"{os.path.basename(path)}: {exc}")
+
+        if self.combine_output.get():
+            all_records: list[LodRecord] = []
+            for path in self.selected_files:
+                all_records.extend(parsed_records_by_file.get(path, []))
+
+            if all_records:
+                for view_type in selected_views:
+                    rows = summarize_records(all_records, view_type)
+                    view_label = dict(VIEW_OPTIONS)[view_type]
+                    output_name = f"Combined_Load_{view_label}.csv"
+                    output_path = os.path.join(output_dir, output_name)
+
+                    write_csv(output_path, rows)
+                    exported_files.append(output_path)
+        else:
+            for path in self.selected_files:
+                records = parsed_records_by_file.get(path)
+                if not records:
+                    continue
 
                 base_name = os.path.splitext(os.path.basename(path))[0]
                 for view_type in selected_views:
@@ -392,8 +458,14 @@ class LodSummaryApp:
 
                     write_csv(output_path, rows)
                     exported_files.append(output_path)
-            except Exception as exc:
-                failures.append(f"{os.path.basename(path)}: {exc}")
+
+        if not exported_files:
+            self.status_text.set("No files exported.")
+            messagebox.showerror(
+                "Export failed",
+                "No CSV files were created. Review the errors and try again.",
+            )
+            return
 
         if failures:
             self.status_text.set("Completed with errors.")
